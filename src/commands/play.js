@@ -95,8 +95,11 @@ module.exports = {
           embeds: [
             createNebulaEmbed(interaction.client, {
               color: COLORS.ERROR,
-              title: '❌ Sin Resultados',
-              description: `> No se pudo encontrar ninguna pista de audio para: **\`${query}\`**.\nVerifica que el título o enlace sea accesible públicamente.`
+              title: '❌ Sin Resultados / Video No Disponible',
+              description:
+                `> No se pudo obtener la pista de audio para el enlace:\n> **\`${query}\`**\n\n` +
+                `${SYMBOLS.ARROW} Verifica que el video o canción esté disponible públicamente y no tenga restricciones de edad ni esté eliminado.\n` +
+                `${SYMBOLS.ARROW} También puedes buscar directamente por nombre (ej: \`/play pokito daddy yankee\`).`
             })
           ]
         });

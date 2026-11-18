@@ -23,6 +23,7 @@
     "libsodium-wrappers": "^0.8.4",
     "minecraft-data": "^3.119.0",
     "opusscript": "^0.0.8",
-    "play-dl": "^1.9.7"
+    "play-dl": "^1.9.7",
+    "yt-search": "^2.13.1"
   }
 }

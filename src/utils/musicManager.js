@@ -1,6 +1,7 @@
 // ============================================================
 // Nebula Bot - Gestor Avanzado de Música y Canales de Voz
-// Motor Directo FFmpeg + yt-dlp (YouTube & Spotify)
+// Motor Multiplataforma (yt-search + FFmpeg + yt-dlp)
+// Compatible con Windows y Servidores Linux VM
 // Nebula Dev Studios • nebuladevstudios.com
 // ============================================================
 
@@ -13,21 +14,87 @@ const {
   entersState,
   StreamType
 } = require('@discordjs/voice');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const ffmpegPath = require('ffmpeg-static');
-const play = require('play-dl');
-const ytdlPath = path.join(__dirname, '..', '..', 'bin', 'yt-dlp.exe');
+const yts = require('yt-search');
+let play;
+try { play = require('play-dl'); } catch (e) {}
 
 // Almacén de sesiones activas (guildId -> Session)
 const activeSessions = new Map();
 
 /**
+ * Detecta la ruta del binario yt-dlp en el sistema o carpeta local
+ */
+function getYtDlpPath() {
+  const isWin = process.platform === 'win32';
+  const binDir = path.join(__dirname, '..', '..', 'bin');
+  const localBinary = path.join(binDir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
+
+  if (fs.existsSync(localBinary)) {
+    return localBinary;
+  }
+
+  // Verificar si yt-dlp está instalado globalmente en el PATH del sistema
+  try {
+    const check = spawnSync(isWin ? 'where' : 'which', ['yt-dlp']);
+    if (check.status === 0 && check.stdout.toString().trim()) {
+      return check.stdout.toString().trim().split('\n')[0].trim();
+    }
+  } catch (e) {}
+
+  return localBinary;
+}
+
+/**
+ * Garantiza que el binario de yt-dlp esté disponible y con permisos de ejecución
+ */
+async function ensureYtDlp() {
+  const binPath = getYtDlpPath();
+  if (fs.existsSync(binPath)) {
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(binPath, 0o755); } catch (e) {}
+    }
+    return binPath;
+  }
+
+  const isWin = process.platform === 'win32';
+  const binDir = path.join(__dirname, '..', '..', 'bin');
+  if (!fs.existsSync(binDir)) {
+    fs.mkdirSync(binDir, { recursive: true });
+  }
+
+  const downloadUrl = isWin
+    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
+  console.log(`[Música] Descargando motor de audio yt-dlp para ${process.platform}...`);
+  try {
+    const res = await fetch(downloadUrl);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(binPath, buffer);
+    if (!isWin) {
+      fs.chmodSync(binPath, 0o755);
+    }
+    console.log('[Música] Motor yt-dlp configurado exitosamente.');
+    return binPath;
+  } catch (err) {
+    console.error('[Música] Error descargando yt-dlp:', err.message);
+    return binPath;
+  }
+}
+
+/**
  * Extrae la URL directa de audio mediante yt-dlp
  */
-function getDirectAudioUrl(targetQuery) {
+async function getDirectAudioUrl(targetQuery) {
+  const ytdl = await ensureYtDlp();
+
   return new Promise(resolve => {
-    const proc = spawn(ytdlPath, [
+    const proc = spawn(ytdl, [
       '--no-warnings',
       '-g',
       '-f', 'bestaudio/best',
@@ -41,7 +108,19 @@ function getDirectAudioUrl(targetQuery) {
       if (code === 0 && url.trim()) {
         resolve(url.trim().split('\n')[0]);
       } else {
-        resolve(null);
+        // Fallback: intentar sin selector estricto de formato
+        const procFallback = spawn(ytdl, [
+          '--no-warnings',
+          '-g',
+          '--no-playlist',
+          targetQuery
+        ]);
+        let urlFallback = '';
+        procFallback.stdout.on('data', d => { urlFallback += d.toString(); });
+        procFallback.on('close', c => {
+          resolve(c === 0 && urlFallback.trim() ? urlFallback.trim().split('\n')[0] : null);
+        });
+        procFallback.on('error', () => resolve(null));
       }
     });
     proc.on('error', () => resolve(null));
@@ -54,26 +133,7 @@ function getDirectAudioUrl(targetQuery) {
 async function resolveTrack(query) {
   query = query.trim();
 
-  // 1. Detectar si es un enlace de Spotify
-  if (query.includes('spotify.com/track/')) {
-    try {
-      const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(query)}`);
-      if (oembedRes.ok) {
-        const data = await oembedRes.json();
-        const searchQuery = `ytsearch1:${data.title}`;
-        const ytTrack = await extractWithYtdl(searchQuery);
-        if (ytTrack) {
-          ytTrack.source = 'Spotify (vía YouTube)';
-          if (data.thumbnail_url) ytTrack.thumbnail = data.thumbnail_url;
-          return ytTrack;
-        }
-      }
-    } catch (e) {
-      console.warn('Error resolviendo Spotify oEmbed:', e.message);
-    }
-  }
-
-  // 3. Detectar si es un enlace de audio directo (.mp3, .ogg, etc.)
+  // 1. Detectar si es un enlace de audio directo (.mp3, .ogg, etc.)
   if (/\.(mp3|ogg|wav|aac)($|\?)/i.test(query)) {
     return {
       title: query.split('/').pop().split('?')[0] || 'Archivo de Audio Web',
@@ -85,57 +145,76 @@ async function resolveTrack(query) {
     };
   }
 
-  // 4. Si es un enlace de YouTube o búsqueda de texto
-  let targetQuery = query;
-  if (!query.startsWith('http://') && !query.startsWith('https://')) {
-    targetQuery = `ytsearch1:${query}`;
+  // 2. Detectar si es un enlace de Spotify
+  if (query.includes('spotify.com/')) {
+    try {
+      const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(query)}`);
+      if (oembedRes.ok) {
+        const data = await oembedRes.json();
+        const searchTitle = data.title;
+        const res = await yts(searchTitle);
+        if (res && res.videos && res.videos.length > 0) {
+          const first = res.videos[0];
+          return {
+            title: data.title,
+            duration: first.timestamp || 'Desconocida',
+            thumbnail: data.thumbnail_url || first.thumbnail,
+            webUrl: first.url,
+            targetQuery: first.url,
+            source: 'Spotify (vía YouTube)',
+            channel: first.author ? first.author.name : 'Spotify',
+            isDirectStream: false
+          };
+        }
+      }
+    } catch (e) {
+      console.warn('[Música] Error resolviendo Spotify:', e.message);
+    }
   }
 
-  const ytTrack = await extractWithYtdl(targetQuery);
-  if (ytTrack) {
-    ytTrack.source = 'YouTube';
-    return ytTrack;
+  // 3. Extraer ID si es un enlace de YouTube o YouTube Music
+  const ytMatch = query.match(/(?:v=|\/|youtu\.be\/|vi\/|embed\/)([a-zA-Z0-9_-]{11})/);
+  if (ytMatch && ytMatch[1]) {
+    const videoId = ytMatch[1];
+    try {
+      const r = await yts({ videoId });
+      if (r && r.title && r.title !== 'video unavailable') {
+        const isYtMusic = query.includes('music.youtube.com');
+        return {
+          title: r.title,
+          duration: r.timestamp || 'En vivo',
+          thumbnail: r.thumbnail || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          webUrl: r.url || `https://www.youtube.com/watch?v=${videoId}`,
+          targetQuery: r.url || `https://www.youtube.com/watch?v=${videoId}`,
+          source: isYtMusic ? 'YouTube Music' : 'YouTube',
+          channel: r.author ? r.author.name : 'Artista',
+          isDirectStream: false
+        };
+      }
+    } catch (e) {
+      console.warn('[Música] Error en consulta por videoId:', e.message);
+    }
   }
+
+  // 4. Búsqueda por texto directo
+  try {
+    const res = await yts(query);
+    if (res && res.videos && res.videos.length > 0) {
+      const first = res.videos[0];
+      return {
+        title: first.title,
+        duration: first.timestamp || 'En vivo',
+        thumbnail: first.thumbnail || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
+        webUrl: first.url,
+        targetQuery: first.url,
+        source: 'YouTube',
+        channel: first.author ? first.author.name : 'Artista',
+        isDirectStream: false
+      };
+    }
+  } catch (e) {}
 
   return null;
-}
-
-/**
- * Utiliza yt-dlp para extraer metadata rápida de YouTube
- */
-function extractWithYtdl(query) {
-  return new Promise(resolve => {
-    const proc = spawn(ytdlPath, [
-      '--no-warnings',
-      '--print', '%(title)s|||%(duration_string)s|||%(thumbnail)s|||%(webpage_url)s',
-      '--no-playlist',
-      query
-    ]);
-
-    let output = '';
-    proc.stdout.on('data', data => { output += data.toString(); });
-
-    proc.on('close', code => {
-      if (code === 0 && output.trim()) {
-        const parts = output.trim().split('|||');
-        resolve({
-          title: parts[0] || 'Canción Desconocida',
-          duration: parts[1] || 'En vivo',
-          thumbnail: parts[2] || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
-          webUrl: parts[3] || query,
-          targetQuery: parts[3] || query,
-          isDirectStream: false
-        });
-      } else {
-        resolve(null);
-      }
-    });
-
-    proc.on('error', err => {
-      console.error('Error ejecutando yt-dlp:', err);
-      resolve(null);
-    });
-  });
 }
 
 /**
@@ -144,24 +223,24 @@ function extractWithYtdl(query) {
 async function searchTracks(query, limit = 5) {
   query = query.trim();
 
-  // 1. Detectar enlaces de Spotify (track, album, playlist)
+  // 1. Detectar enlaces de Spotify
   if (query.includes('spotify.com/')) {
     try {
       const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(query)}`);
       if (oembedRes.ok) {
         const data = await oembedRes.json();
         const searchTitle = data.title;
-        const ytResults = await play.search(searchTitle, { limit: 1 });
-        if (ytResults && ytResults.length > 0) {
-          const first = ytResults[0];
+        const res = await yts(searchTitle);
+        if (res && res.videos && res.videos.length > 0) {
+          const first = res.videos[0];
           return [{
             title: data.title,
-            duration: first.durationRaw || 'Desconocida',
-            thumbnail: data.thumbnail_url || first.thumbnails?.[0]?.url,
+            duration: first.timestamp || 'Desconocida',
+            thumbnail: data.thumbnail_url || first.thumbnail,
             webUrl: first.url,
             targetQuery: first.url,
             source: 'Spotify (vía YouTube)',
-            channel: first.channel?.name || 'Spotify',
+            channel: first.author ? first.author.name : 'Spotify',
             isDirectStream: false
           }];
         }
@@ -178,78 +257,27 @@ async function searchTracks(query, limit = 5) {
     return [];
   }
 
-  // 3. Búsqueda por texto en YouTube y Spotify
+  // 3. Búsqueda por texto en YouTube usando yt-search (sin fallos de browseId)
   try {
-    const playResults = await play.search(query, { limit });
-    if (playResults && playResults.length > 0) {
-      return playResults.map(r => {
-        const titleLower = r.title.toLowerCase();
-        const isSpotifyTopic = r.channel?.name?.toLowerCase().includes('topic') || titleLower.includes('official audio');
-        return {
-          title: r.title,
-          duration: r.durationRaw || 'En vivo',
-          thumbnail: r.thumbnails?.[0]?.url || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
-          webUrl: r.url,
-          targetQuery: r.url,
-          source: isSpotifyTopic ? 'Spotify / YouTube Music' : 'YouTube',
-          channel: r.channel?.name || 'Artista',
-          isDirectStream: false
-        };
-      });
+    const res = await yts(query);
+    const videos = res.videos || [];
+    if (videos.length > 0) {
+      return videos.slice(0, limit).map(v => ({
+        title: v.title,
+        duration: v.timestamp || 'En vivo',
+        thumbnail: v.thumbnail || v.image || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
+        webUrl: v.url,
+        targetQuery: v.url,
+        source: query.toLowerCase().includes('spotify') ? 'Spotify / YouTube Music' : 'YouTube',
+        channel: v.author ? v.author.name : 'Artista',
+        isDirectStream: false
+      }));
     }
   } catch (err) {
-    console.warn('[Música] Error en play.search, ejecutando fallback yt-dlp:', err.message);
+    console.warn('[Música] Error en búsqueda de canciones:', err.message);
   }
 
-  // 4. Fallback con yt-dlp si play.search falla
-  try {
-    const ytdlResults = await extractMultipleWithYtdl(`ytsearch${limit}:${query}`);
-    return ytdlResults;
-  } catch (e) {
-    console.error('[Música] Error en fallback yt-dlp:', e);
-    return [];
-  }
-}
-
-/**
- * Utiliza yt-dlp para extraer múltiples resultados
- */
-function extractMultipleWithYtdl(searchQuery) {
-  return new Promise(resolve => {
-    const proc = spawn(ytdlPath, [
-      '--no-warnings',
-      '--print', '%(title)s|||%(duration_string)s|||%(thumbnail)s|||%(webpage_url)s|||%(channel)s',
-      '--no-playlist',
-      searchQuery
-    ]);
-
-    let output = '';
-    proc.stdout.on('data', data => { output += data.toString(); });
-
-    proc.on('close', code => {
-      if (code === 0 && output.trim()) {
-        const lines = output.trim().split('\n').filter(l => l.trim().length > 0);
-        const tracks = lines.map(line => {
-          const parts = line.split('|||');
-          return {
-            title: parts[0] || 'Canción Desconocida',
-            duration: parts[1] || 'En vivo',
-            thumbnail: parts[2] || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
-            webUrl: parts[3] || '',
-            targetQuery: parts[3] || '',
-            source: 'YouTube',
-            channel: parts[4] || 'Artista',
-            isDirectStream: false
-          };
-        });
-        resolve(tracks);
-      } else {
-        resolve([]);
-      }
-    });
-
-    proc.on('error', () => resolve([]));
-  });
+  return [];
 }
 
 /**
@@ -510,5 +538,6 @@ module.exports = {
   stopTrack,
   togglePause,
   setVolume,
-  getSession
+  getSession,
+  ensureYtDlp
 };
