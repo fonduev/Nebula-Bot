@@ -12,7 +12,7 @@ function getMainHelpEmbed(client) {
     title: '🌌 Centro de Control & Ayuda | Nebula Bot',
     description:
       `>>> **¡Bienvenido a Nebula Bot!** El ecosistema integral de Minecraft, música, soporte y comunidad gamer de **Nebula Dev Studios**.\n\n` +
-      `${SYMBOLS.STAR} Explora **75 comandos slash (/)** organizados por categorías en el menú desplegable inferior.\n` +
+      `${SYMBOLS.STAR} Explora **76 comandos slash (/)** organizados por categorías en el menú desplegable inferior.\n` +
       `${SYMBOLS.STAR} Incluye integración con **Nebula Launcher**, **Buscador de Mods Modrinth**, **Auto-Voz**, **Casino**, **Tickets**, **Embed Studio V2** y **Música** sin cortes.`,
     fields: [
       {
@@ -41,8 +41,8 @@ function getMainHelpEmbed(client) {
         inline: false
       },
       {
-        name: '📊 Comunidad & Diagnóstico (7)',
-        value: '`/serverinfo` • `/userinfo` • `/avatar` • `/roles` • `/botinfo` • `/ping` • `/ip`\n*Estadísticas avanzadas, perfiles con XP, niveles y velocímetro de red.*',
+        name: '📊 Comunidad, Invitación & Diagnóstico (8)',
+        value: '`/invitar` • `/serverinfo` • `/userinfo` • `/avatar` • `/roles` • `/botinfo` • `/ping` • `/ip`\n*Enlaces de invitación oficial para otros servidores, estadísticas y perfiles.*',
         inline: false
       },
       {

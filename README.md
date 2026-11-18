@@ -2,9 +2,29 @@
   <h1>🌌 Nebula Bot</h1>
   <p><strong>El bot oficial de Discord para Nebula Dev Studios & Nebula Launcher</strong></p>
   <p>Ecosistema integral de Minecraft, música de alta fidelidad, tickets interactivos, niveles, moderación y soporte comunitario.</p>
+  <br>
+  <p>
+    <a href="https://discord.com/oauth2/authorize?client_id=1565335954284224622&permissions=8&integration_type=0&scope=bot+applications.commands">
+      <img src="https://img.shields.io/badge/Añadir%20Bot%20a%20tu%20Servidor-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Invitar a Discord">
+    </a>
+    <a href="https://discord.gg/cfE254mQHZ">
+      <img src="https://img.shields.io/badge/Servidor%20de%20Soporte-23272A?style=for-the-badge&logo=discord&logoColor=white" alt="Soporte">
+    </a>
+  </p>
 </div>
 
 ---
+
+## ➕ ¿Cómo invitar a Nebula Bot a tu servidor?
+
+Puedes añadirlo a cualquier servidor de Discord donde tengas permisos de **Administrador** o **Gestionar Servidor**:
+
+👉 **[Haz clic aquí para añadir a Nebula Bot](https://discord.com/oauth2/authorize?client_id=1565335954284224622&permissions=8&integration_type=0&scope=bot+applications.commands)**
+
+1. Selecciona tu servidor en la lista desplegable.
+2. Haz clic en **Continuar** y autoriza los permisos recomendados.
+3. En la configuración de roles de tu servidor, asegúrate de colocar el rol de **Nebula Bot** por encima de los miembros que moderará.
+4. ¡Listo! Escribe `/ayuda` en cualquier canal para ver los 76 comandos disponibles.
 
 ## 🚀 Características Principales
 

@@ -344,6 +344,11 @@ module.exports = {
               `>>> **Información del servidor, usuarios y conectividad en vivo**`,
             fields: [
               {
+                name: '`▹ /invitar`',
+                value: 'Genera los enlaces oficiales para invitar a Nebula Bot a cualquier servidor con guía de primeros pasos.',
+                inline: false
+              },
+              {
                 name: '`▹ /serverinfo`',
                 value: 'Panel analítico del servidor: propietario, fecha de creación, recuento de miembros, canales, roles y mejoras.',
                 inline: false

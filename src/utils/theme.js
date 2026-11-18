@@ -88,6 +88,11 @@ function createNebulaEmbed(client, options = {}) {
 function createOfficialButtonsRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
+      .setLabel('Invitar Bot')
+      .setStyle(ButtonStyle.Link)
+      .setEmoji('➕')
+      .setURL('https://discord.com/oauth2/authorize?client_id=1565335954284224622&permissions=8&integration_type=0&scope=bot+applications.commands'),
+    new ButtonBuilder()
       .setLabel('Web Oficial')
       .setStyle(ButtonStyle.Link)
       .setEmoji('🌐')
@@ -106,7 +111,7 @@ function createOfficialButtonsRow() {
       .setLabel('GitHub')
       .setStyle(ButtonStyle.Link)
       .setEmoji('🐙')
-      .setURL('https://github.com/fonduev/astral-nebula-launcher')
+      .setURL('https://github.com/fonduev/Nebula-Bot')
   );
 }
 
