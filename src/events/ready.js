@@ -3,6 +3,7 @@ const { getAllAutoStatus, addMessageXp } = require('../utils/database');
 const { buildServerStatusEmbed, createAutoStatusButtons } = require('../commands/auto-status');
 const { activeVoiceSessions } = require('./voiceStateUpdate');
 const { createNebulaEmbed, COLORS, SYMBOLS } = require('../utils/theme');
+const { ensureYtDlp } = require('../utils/musicManager');
 
 module.exports = {
   name: Events.ClientReady,
@@ -16,6 +17,9 @@ module.exports = {
     console.log(`  🌐 Servidores:  ${client.guilds.cache.size}`);
     console.log(`  ⚡ Comandos:   ${client.commands.size} registrados`);
     console.log(`======================================================\n`);
+
+    // Precalentar motor de audio de forma no bloqueante
+    ensureYtDlp().catch(err => console.warn('[Música] Aviso en precalentamiento:', err.message));
 
     // Rotación dinámica de presencia cada 15 segundos
     const activities = [

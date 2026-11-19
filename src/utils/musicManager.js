@@ -86,21 +86,21 @@ async function scrapeYouTubeDirect(query, limit = 5) {
  */
 function getYtDlpPath() {
   const isWin = process.platform === 'win32';
-  const binDir = path.join(__dirname, '..', '..', 'bin');
-  const localBinary = path.join(binDir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
 
-  if (fs.existsSync(localBinary)) {
-    return localBinary;
-  }
-
-  // Verificar si yt-dlp está instalado globalmente en el PATH del sistema
+  // 1. Priorizar binario global instalado en el PATH del sistema operativo (ej. apt, pip, etc.)
   try {
     const check = spawnSync(isWin ? 'where' : 'which', ['yt-dlp']);
     if (check.status === 0 && check.stdout.toString().trim()) {
-      return check.stdout.toString().trim().split('\n')[0].trim();
+      const sysPath = check.stdout.toString().trim().split('\n')[0].trim();
+      if (fs.existsSync(sysPath)) {
+        return sysPath;
+      }
     }
   } catch (e) {}
 
+  // 2. Si no existe global, buscar en la carpeta local bin/
+  const binDir = path.join(__dirname, '..', '..', 'bin');
+  const localBinary = path.join(binDir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
   return localBinary;
 }
 
@@ -108,25 +108,43 @@ function getYtDlpPath() {
  * Garantiza que el binario de yt-dlp esté disponible y con permisos de ejecución
  */
 async function ensureYtDlp() {
-  const binPath = getYtDlpPath();
-  if (fs.existsSync(binPath)) {
-    if (process.platform !== 'win32') {
-      try { fs.chmodSync(binPath, 0o755); } catch (e) {}
-    }
-    return binPath;
-  }
-
   const isWin = process.platform === 'win32';
   const binDir = path.join(__dirname, '..', '..', 'bin');
   if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
+  const binPath = getYtDlpPath();
+
+  // Si se encontró un ejecutable global del sistema fuera de ./bin, usarlo directamente
+  const isLocal = binPath.includes(path.join('bin', isWin ? 'yt-dlp.exe' : 'yt-dlp'));
+  if (!isLocal && fs.existsSync(binPath)) {
+    return binPath;
+  }
+
+  // Verificar si el binario local existe y es válido
+  if (fs.existsSync(binPath)) {
+    if (!isWin) {
+      const stat = fs.statSync(binPath);
+      // Si pesa menos de 15MB en Linux, es el script antiguo de Python (3MB).
+      // Lo eliminamos para descargar el binario autónomo completo yt-dlp_linux (41MB)
+      if (stat.size < 15 * 1024 * 1024) {
+        console.log('[Música] Actualizando binario antiguo a ejecutable autónomo Linux (41MB)...');
+        try { fs.unlinkSync(binPath); } catch (e) {}
+      } else {
+        try { fs.chmodSync(binPath, 0o755); } catch (e) {}
+        return binPath;
+      }
+    } else {
+      return binPath;
+    }
+  }
+
   const downloadUrl = isWin
     ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
-    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 
-  console.log(`[Música] Descargando motor de audio yt-dlp para ${process.platform}...`);
+  console.log(`[Música] Descargando motor de audio autónomo yt-dlp para ${process.platform}...`);
   try {
     const res = await fetch(downloadUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -144,43 +162,89 @@ async function ensureYtDlp() {
 }
 
 /**
- * Extrae la URL directa de audio mediante yt-dlp
+ * Crea el pipeline de audio transmitiendo de yt-dlp a FFmpeg a Discord Voice
  */
-async function getDirectAudioUrl(targetQuery) {
+async function createAudioPipeline(track, volume = 0.5) {
+  const targetUrl = track.targetQuery || track.webUrl;
+  const isDirectAudio = track.isDirectStream || (targetUrl && (targetUrl.endsWith('.mp3') || targetUrl.endsWith('.ogg') || targetUrl.endsWith('.wav')));
+
+  // Caso 1: Archivo o stream de audio directo por URL HTTP/HTTPS
+  if (isDirectAudio) {
+    const ffmpegProc = spawn(ffmpegPath, [
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', targetUrl,
+      '-analyzeduration', '0',
+      '-loglevel', 'error',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+    ffmpegProc.on('error', err => {
+      console.error('[FFmpeg] Error en proceso de audio:', err.message);
+    });
+
+    const resource = createAudioResource(ffmpegProc.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true
+    });
+    if (resource.volume) resource.volume.setVolume(volume);
+
+    return { resource, processes: [ffmpegProc] };
+  }
+
+  // Caso 2: Transmisión directa por tubería yt-dlp -> FFmpeg (Bypass de bloqueo de IPs datacenter)
   const ytdl = await ensureYtDlp();
 
-  return new Promise(resolve => {
-    const proc = spawn(ytdl, [
-      '--no-warnings',
-      '-g',
-      '-f', 'bestaudio/best',
-      '--no-playlist',
-      targetQuery
-    ]);
+  const ytdlProc = spawn(ytdl, [
+    '-o', '-',
+    '-f', 'bestaudio/b',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-check-certificates',
+    '--socket-timeout', '15',
+    '--extractor-args', 'youtube:player_client=android,ios,web',
+    targetUrl
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    let url = '';
-    proc.stdout.on('data', d => { url += d.toString(); });
-    proc.on('close', code => {
-      if (code === 0 && url.trim()) {
-        resolve(url.trim().split('\n')[0]);
-      } else {
-        // Fallback: intentar sin selector estricto de formato
-        const procFallback = spawn(ytdl, [
-          '--no-warnings',
-          '-g',
-          '--no-playlist',
-          targetQuery
-        ]);
-        let urlFallback = '';
-        procFallback.stdout.on('data', d => { urlFallback += d.toString(); });
-        procFallback.on('close', c => {
-          resolve(c === 0 && urlFallback.trim() ? urlFallback.trim().split('\n')[0] : null);
-        });
-        procFallback.on('error', () => resolve(null));
-      }
-    });
-    proc.on('error', () => resolve(null));
+  let ytdlErr = '';
+  ytdlProc.stderr.on('data', d => { ytdlErr += d.toString(); });
+  ytdlProc.on('close', code => {
+    if (code !== 0 && ytdlErr.trim()) {
+      console.warn(`[Música] Advertencia yt-dlp (código ${code}):`, ytdlErr.slice(0, 300).trim());
+    }
   });
+
+  const ffmpegProc = spawn(ffmpegPath, [
+    '-i', 'pipe:0',
+    '-analyzeduration', '0',
+    '-loglevel', 'error',
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', '2',
+    'pipe:1'
+  ], { stdio: ['pipe', 'pipe', 'ignore'] });
+
+  // Conectar salida de yt-dlp con entrada de FFmpeg
+  ytdlProc.stdout.pipe(ffmpegProc.stdin);
+
+  ffmpegProc.on('error', err => {
+    console.error('[FFmpeg] Error en transcodificación:', err.message);
+  });
+
+  const resource = createAudioResource(ffmpegProc.stdout, {
+    inputType: StreamType.Raw,
+    inlineVolume: true
+  });
+
+  if (resource.volume) {
+    resource.volume.setVolume(volume);
+  }
+
+  return { resource, processes: [ytdlProc, ffmpegProc] };
 }
 
 /**
@@ -342,49 +406,18 @@ async function searchTracks(query, limit = 5) {
 }
 
 /**
- * Crea el pipeline de audio directo con FFmpeg
- */
-function createAudioStream(directUrl, volume = 0.5) {
-  const ffmpegProc = spawn(ffmpegPath, [
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '5',
-    '-i', directUrl,
-    '-analyzeduration', '0',
-    '-loglevel', 'error',
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-    'pipe:1'
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-  ffmpegProc.on('error', err => {
-    console.error('[FFmpeg] Error en proceso:', err.message);
-  });
-
-  const resource = createAudioResource(ffmpegProc.stdout, {
-    inputType: StreamType.Raw,
-    inlineVolume: true
-  });
-
-  if (resource.volume) {
-    resource.volume.setVolume(volume);
-  }
-
-  return { resource, process: ffmpegProc };
-}
-
-/**
  * Reproduce la siguiente pista de la cola
  */
 async function playNext(guildId) {
   const session = activeSessions.get(guildId);
   if (!session) return;
 
-  // Limpiar proceso anterior
-  if (session.currentProcess) {
-    try { session.currentProcess.kill('SIGTERM'); } catch (e) {}
-    session.currentProcess = null;
+  // Limpiar procesos anteriores
+  if (session.currentProcesses) {
+    for (const p of session.currentProcesses) {
+      try { p.kill('SIGTERM'); } catch (e) {}
+    }
+    session.currentProcesses = null;
   }
 
   // Si la cola está vacía, finalizar reproducción
@@ -407,19 +440,9 @@ async function playNext(guildId) {
   }
 
   try {
-    let directUrl = track.url;
-    if (!track.isDirectStream) {
-      directUrl = await getDirectAudioUrl(track.targetQuery || track.webUrl);
-      if (!directUrl) {
-        console.error('[Música] No se pudo obtener la URL de transmisión para:', track.title);
-        playNext(guildId);
-        return;
-      }
-    }
-
-    const { resource, process: proc } = createAudioStream(directUrl, session.volume);
+    const { resource, processes } = await createAudioPipeline(track, session.volume);
     session.resource = resource;
-    session.currentProcess = proc;
+    session.currentProcesses = processes;
 
     session.player.play(resource);
     session.isPaused = false;
@@ -444,7 +467,8 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
       channelId: voiceChannel.id,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: true
+      selfDeaf: true,
+      selfMute: false
     });
 
     try {
@@ -465,7 +489,7 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
       currentTrack: null,
       lastTrack: null,
       history: [track.title],
-      currentProcess: null,
+      currentProcesses: null,
       voiceChannel,
       textChannel,
       client: guild.client,
@@ -493,7 +517,8 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
         channelId: voiceChannel.id,
         guildId: guild.id,
         adapterCreator: guild.voiceAdapterCreator,
-        selfDeaf: true
+        selfDeaf: true,
+        selfMute: false
       });
       try {
         await entersState(session.connection, VoiceConnectionStatus.Ready, 15_000);
@@ -540,9 +565,11 @@ function stopTrack(guildId) {
   session.queue = [];
   session.currentTrack = null;
 
-  if (session.currentProcess) {
-    try { session.currentProcess.kill('SIGTERM'); } catch (e) {}
-    session.currentProcess = null;
+  if (session.currentProcesses) {
+    for (const p of session.currentProcesses) {
+      try { p.kill('SIGTERM'); } catch (e) {}
+    }
+    session.currentProcesses = null;
   }
 
   try {
