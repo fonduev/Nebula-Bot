@@ -110,26 +110,12 @@ async function scrapeYouTubeDirect(query, limit = 5) {
  */
 function getYtDlpPath() {
   const isWin = process.platform === 'win32';
-
-  // 1. Priorizar binario global instalado en el PATH del sistema operativo (ej. apt, pip, etc.)
-  try {
-    const check = spawnSync(isWin ? 'where' : 'which', ['yt-dlp']);
-    if (check.status === 0 && check.stdout.toString().trim()) {
-      const sysPath = check.stdout.toString().trim().split('\n')[0].trim();
-      if (fs.existsSync(sysPath)) {
-        return sysPath;
-      }
-    }
-  } catch (e) {}
-
-  // 2. Si no existe global, buscar en la carpeta local bin/
   const binDir = path.join(__dirname, '..', '..', 'bin');
-  const localBinary = path.join(binDir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
-  return localBinary;
+  return path.join(binDir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
 }
 
 /**
- * Garantiza que el binario de yt-dlp esté disponible y con permisos de ejecución
+ * Garantiza que el binario autónomo de yt-dlp esté disponible y actualizado
  */
 async function ensureYtDlp() {
   const isWin = process.platform === 'win32';
@@ -140,25 +126,17 @@ async function ensureYtDlp() {
 
   const binPath = getYtDlpPath();
 
-  // Si se encontró un ejecutable global del sistema fuera de ./bin, usarlo directamente
-  const isLocal = binPath.includes(path.join('bin', isWin ? 'yt-dlp.exe' : 'yt-dlp'));
-  if (!isLocal && fs.existsSync(binPath)) {
-    return binPath;
-  }
-
-  // Verificar si el binario local existe y es válido
+  // Verificar si el binario local autónomo existe y es válido
   if (fs.existsSync(binPath)) {
     if (!isWin) {
       const stat = fs.statSync(binPath);
-      // Si pesa menos de 15MB en Linux, es el script antiguo de Python (3MB).
-      // Lo eliminamos para descargar el binario autónomo completo yt-dlp_linux (41MB)
-      if (stat.size < 15 * 1024 * 1024) {
-        console.log('[Música] Actualizando binario antiguo a ejecutable autónomo Linux (41MB)...');
-        try { fs.unlinkSync(binPath); } catch (e) {}
-      } else {
+      // El binario autónomo yt-dlp_linux de GitHub pesa ~41MB. Si pesa menos de 15MB, es un script antiguo de apt/python.
+      if (stat.size >= 15 * 1024 * 1024) {
         try { fs.chmodSync(binPath, 0o755); } catch (e) {}
         return binPath;
       }
+      console.log('[Música] Reemplazando binario antiguo por versión autónoma Linux oficial (41MB)...');
+      try { fs.unlinkSync(binPath); } catch (e) {}
     } else {
       return binPath;
     }
@@ -168,7 +146,7 @@ async function ensureYtDlp() {
     ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
     : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 
-  console.log(`[Música] Descargando motor de audio autónomo yt-dlp para ${process.platform}...`);
+  console.log(`[Música] Descargando motor de audio autónomo oficial yt-dlp para ${process.platform}...`);
   try {
     const res = await fetch(downloadUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -177,10 +155,18 @@ async function ensureYtDlp() {
     if (!isWin) {
       fs.chmodSync(binPath, 0o755);
     }
-    console.log('[Música] Motor yt-dlp configurado exitosamente.');
+    console.log('[Música] Motor yt-dlp autónomo instalado exitosamente en ./bin.');
     return binPath;
   } catch (err) {
     console.error('[Música] Error descargando yt-dlp:', err.message);
+    // Como último recurso en caso de error de red al descargar, buscar en PATH global
+    try {
+      const check = spawnSync(isWin ? 'where' : 'which', ['yt-dlp']);
+      if (check.status === 0 && check.stdout.toString().trim()) {
+        const sysPath = check.stdout.toString().trim().split('\n')[0].trim();
+        if (fs.existsSync(sysPath)) return sysPath;
+      }
+    } catch (e) {}
     return binPath;
   }
 }
@@ -234,14 +220,14 @@ async function resolveAudioStreamUrl(track) {
   const nodePath = process.execPath || 'node';
   const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
 
-  // Capa 1: Extraer audio ORIGINAL de YouTube vía Cliente Android Oficial (Ultrarrápido)
-  // El cliente Android de YouTube no tiene el bloqueo de bots/CAPTCHA de los datacenters en la nube.
+  // Capa 1: Extraer audio ORIGINAL de YouTube vía Clientes Oficiales Android/Móvil
+  // El cliente Android/Mweb de YouTube evita los bloqueos de bots de datacenters
   if (isYouTube) {
     try {
       const ytArgs = [
         '-g',
-        '-f', '18/b',
-        '--extractor-args', 'youtube:player_client=android',
+        '-f', '18/140/251/bestaudio/best',
+        '--extractor-args', 'youtube:player_client=android,web,mweb',
         '--no-warnings',
         '--no-check-certificates',
         '--no-cache-dir'
@@ -254,7 +240,9 @@ async function resolveAudioStreamUrl(track) {
       ytArgs.push(targetUrl);
       const proc = spawn(ytdl, ytArgs);
       let directUrl = '';
+      let errOutput = '';
       proc.stdout.on('data', d => { directUrl += d.toString(); });
+      proc.stderr.on('data', d => { errOutput += d.toString(); });
       await new Promise(r => proc.on('close', r));
 
       const finalUrl = directUrl.trim().split('\n')[0].trim();
@@ -267,12 +255,15 @@ async function resolveAudioStreamUrl(track) {
         console.log(`[Música] Transmitiendo versión original oficial: "${track.title}" (YouTube Audio Master)`);
         return { streamUrl: finalUrl, isDirect: true };
       }
+      if (errOutput) {
+        console.warn(`[Música] YouTube Android/Mweb aviso: ${errOutput.slice(0, 150)}`);
+      }
     } catch (e) {
       console.warn('[Música] Falló cliente móvil de YouTube, probando respaldo...', e.message);
     }
   }
 
-  // Capa 2: Respaldo en SoundCloud (Filtrando estrictamente covers, versiones acústicas y previews)
+  // Capa 2: Respaldo en SoundCloud (Filtrado estricto anti-covers y verificación de palabras clave)
   if (isYouTube) {
     const cleanTitle = cleanQueryForAudio(track.title);
     const searchQuery = `scsearch10:${cleanTitle || track.title}`;
@@ -290,20 +281,31 @@ async function resolveAudioStreamUrl(track) {
       await new Promise(r => searchProc.on('close', r));
 
       const lines = jsonOutput.trim().split('\n').filter(Boolean);
+      const keywords = (cleanTitle || track.title || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
       let pickedUrl = null;
       let pickedDuration = 0;
+
       for (const line of lines) {
         try {
           const item = JSON.parse(line);
           const tLower = (item.title || '').toLowerCase();
-          // Descartar imitaciones, covers amateurs con guitarra, tributos o karaokes
-          const isAmateurCover = /cover|ac[uú]stic|guitar|tributo|karaoke|instrumental|remix/i.test(tLower);
+          const uploaderLower = (item.uploader || '').toLowerCase();
 
-          // Filtrar previews de 30s (SoundCloud Go+ Previews), transmisiones en vivo y covers
+          // El título DEBE contener las palabras clave esenciales de la canción
+          const hasKeyword = keywords.length === 0 || keywords.some(kw => tLower.includes(kw));
+          if (!hasKeyword) continue;
+
+          // Descartar imitaciones, covers amateurs, guitarras, tributos, karaokes o re-subidos extraños
+          const isAmateurCover =
+            /\b(cover|ac[uú]stic|guitar|guitarra|tributo|karaoke|instrumental|remix|parodia|tutorial|letra|lyrics)\b/i.test(tLower) ||
+            /canci[oó]n de|\bx\b|\.m4a|\.mp3/i.test(tLower) ||
+            /cover|guitar|records/i.test(uploaderLower);
+
+          // Filtrar previews de 30s (SoundCloud Go+ Previews), transmisiones en vivo y covers de aficionados
           if (item.duration && item.duration > 60 && !item.is_live && !isAmateurCover) {
             pickedUrl = item.webpage_url || item.url;
             pickedDuration = Math.round(item.duration);
-            console.log(`[Música] Pista oficial localizada en SoundCloud: "${item.title}" (${pickedDuration}s)`);
+            console.log(`[Música] Pista oficial válida localizada en SoundCloud: "${item.title}" (${pickedDuration}s)`);
             break;
           }
         } catch (e) {}
@@ -318,6 +320,8 @@ async function resolveAudioStreamUrl(track) {
         if (finalUrl && finalUrl.startsWith('http')) {
           return { streamUrl: finalUrl, isDirect: true, durationSec: pickedDuration };
         }
+      } else {
+        console.warn(`[Música] SoundCloud no posee versión completa oficial autorizada para "${track.title}" (descartando covers de aficionados).`);
       }
     } catch (err) {
       console.warn('[Música] Advertencia al resolver en SoundCloud:', err.message);
