@@ -17,7 +17,31 @@ const {
 const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const ffmpegPath = require('ffmpeg-static');
+
+let ffmpegStaticPath = null;
+try { ffmpegStaticPath = require('ffmpeg-static'); } catch (e) {}
+
+/**
+ * Obtiene la ruta ejecutable de FFmpeg (sistema o binario estático con permisos de ejecución en Linux)
+ */
+function getFfmpegBinary() {
+  const isWin = process.platform === 'win32';
+  try {
+    const check = spawnSync(isWin ? 'where' : 'which', ['ffmpeg']);
+    if (check.status === 0 && check.stdout.toString().trim()) {
+      const p = check.stdout.toString().trim().split('\n')[0].trim();
+      if (fs.existsSync(p)) return p;
+    }
+  } catch (e) {}
+
+  if (ffmpegStaticPath && fs.existsSync(ffmpegStaticPath)) {
+    if (!isWin) {
+      try { fs.chmodSync(ffmpegStaticPath, 0o755); } catch (e) {}
+    }
+    return ffmpegStaticPath;
+  }
+  return 'ffmpeg';
+}
 
 let yts;
 try { yts = require('yt-search'); } catch (e) {}
@@ -169,8 +193,9 @@ async function createAudioPipeline(track, volume = 0.5) {
   const isDirectAudio = track.isDirectStream || (targetUrl && (targetUrl.endsWith('.mp3') || targetUrl.endsWith('.ogg') || targetUrl.endsWith('.wav')));
 
   // Caso 1: Archivo o stream de audio directo por URL HTTP/HTTPS
+  const ffmpegBin = getFfmpegBinary();
   if (isDirectAudio) {
-    const ffmpegProc = spawn(ffmpegPath, [
+    const ffmpegProc = spawn(ffmpegBin, [
       '-reconnect', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5',
@@ -220,7 +245,7 @@ async function createAudioPipeline(track, volume = 0.5) {
     }
   });
 
-  const ffmpegProc = spawn(ffmpegPath, [
+  const ffmpegProc = spawn(ffmpegBin, [
     '-i', 'pipe:0',
     '-analyzeduration', '0',
     '-loglevel', 'error',
@@ -232,6 +257,10 @@ async function createAudioPipeline(track, volume = 0.5) {
 
   // Conectar salida de yt-dlp con entrada de FFmpeg
   ytdlProc.stdout.pipe(ffmpegProc.stdin);
+
+  ytdlProc.stdout.on('error', () => {});
+  ffmpegProc.stdin.on('error', () => {});
+  ffmpegProc.stdout.on('error', () => {});
 
   ffmpegProc.on('error', err => {
     console.error('[FFmpeg] Error en transcodificación:', err.message);
@@ -482,6 +511,14 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
 
     const player = createAudioPlayer();
     connection.subscribe(player);
+
+    connection.on('stateChange', (oldState, newState) => {
+      console.log(`[Voz] Conexión de audio: ${oldState.status} -> ${newState.status}`);
+    });
+
+    player.on('stateChange', (oldState, newState) => {
+      console.log(`[Música] Estado del reproductor: ${oldState.status} -> ${newState.status}`);
+    });
 
     session = {
       guildId,
