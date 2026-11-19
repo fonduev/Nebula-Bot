@@ -46,6 +46,12 @@ module.exports = {
         npmOutput = e.message;
       }
 
+      // 3.1 Sincronizar comandos slash en Discord
+      try {
+        console.log('[Auto-Updater] Sincronizando comandos slash...');
+        execSync('node src/deploy-commands.js', { encoding: 'utf8' });
+      } catch (e) {}
+
       // 4. Obtener nuevo commit tras el pull
       let afterCommit = beforeCommit;
       try {

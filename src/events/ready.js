@@ -1,4 +1,4 @@
-const { Events, ActivityType } = require('discord.js');
+const { Events, ActivityType, REST, Routes } = require('discord.js');
 const { getAllAutoStatus, addMessageXp } = require('../utils/database');
 const { buildServerStatusEmbed, createAutoStatusButtons } = require('../commands/auto-status');
 const { activeVoiceSessions } = require('./voiceStateUpdate');
@@ -17,6 +17,27 @@ module.exports = {
     console.log(`  🌐 Servidores:  ${client.guilds.cache.size}`);
     console.log(`  ⚡ Comandos:   ${client.commands.size} registrados`);
     console.log(`======================================================\n`);
+
+    // Sincronizar automáticamente comandos slash con la API de Discord al encender
+    (async () => {
+      try {
+        const token = process.env.DISCORD_TOKEN;
+        const clientId = client.user.id;
+        if (token && clientId) {
+          const rest = new REST({ version: '10' }).setToken(token);
+          const slashCommands = [];
+          for (const cmd of client.commands.values()) {
+            if (cmd.data && typeof cmd.data.toJSON === 'function') {
+              slashCommands.push(cmd.data.toJSON());
+            }
+          }
+          await rest.put(Routes.applicationCommands(clientId), { body: slashCommands });
+          console.log(`[Slash] Sincronizados exitosamente ${slashCommands.length} comandos slash con Discord.`);
+        }
+      } catch (err) {
+        console.warn('[Slash] Aviso al sincronizar comandos:', err.message);
+      }
+    })();
 
     // Precalentar motor de audio de forma no bloqueante
     ensureYtDlp().catch(err => console.warn('[Música] Aviso en precalentamiento:', err.message));

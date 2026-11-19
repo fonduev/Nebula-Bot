@@ -205,8 +205,9 @@ function cleanQueryForAudio(query) {
 
 /**
  * Resuelve la URL directa de audio (HLS/HTTP) para streaming instantáneo con FFmpeg
- * En servidores en la nube (OCI/AWS/VPS) sin cookies, busca la pista completa de estudio
- * en SoundCloud (>60s) evitando el bloqueo de YouTube y las vistas previas cortadas de 30s.
+ * Extrae directamente el audio ORIGINAL de YouTube utilizando el cliente oficial de Android
+ * el cual no sufre el bloqueo de bots de datacenters (Oracle/AWS), garantizando la versión
+ * original de estudio (evitando covers amateurs, acústicos y snippets de 30 segundos).
  */
 async function resolveAudioStreamUrl(track) {
   const targetUrl = track.targetQuery || track.webUrl;
@@ -221,13 +222,45 @@ async function resolveAudioStreamUrl(track) {
   const nodePath = process.execPath || 'node';
   const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
 
-  // Caso 1: Modo Servidor Nube / Datacenter (sin cookies.txt) para contenido de YouTube
-  // YouTube bloquea Datacenters con "Sign in to confirm you're not a bot".
-  // Resolvemos de forma ultra-rápida la versión completa en SoundCloud High Fidelity.
-  if (!hasCookies && isYouTube) {
+  // Capa 1: Extraer audio ORIGINAL de YouTube vía Cliente Android / iOS Oficial
+  // Este extractor se comunica con la API de YouTube Mobile, la cual no aplica la pantalla
+  // de verificación de bots/CAPTCHA de los datacenters en la nube.
+  if (isYouTube) {
+    try {
+      const ytArgs = [
+        '-g',
+        '-f', 'bestaudio/18/b',
+        '--extractor-args', 'youtube:player_client=android,ios',
+        '--no-warnings',
+        '--no-check-certificates',
+        '--no-cache-dir'
+      ];
+      if (hasCookies) {
+        ytArgs.push('--cookies', cookiesPath);
+        ytArgs.push('--js-runtimes', `node:${nodePath}`);
+      }
+
+      ytArgs.push(targetUrl);
+      const proc = spawn(ytdl, ytArgs);
+      let directUrl = '';
+      proc.stdout.on('data', d => { directUrl += d.toString(); });
+      await new Promise(r => proc.on('close', r));
+
+      const finalUrl = directUrl.trim().split('\n')[0].trim();
+      if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('ERROR:')) {
+        console.log(`[Música] Transmitiendo versión original oficial: "${track.title}" (YouTube Audio Master)`);
+        return { streamUrl: finalUrl, isDirect: true };
+      }
+    } catch (e) {
+      console.warn('[Música] Falló cliente móvil de YouTube, probando respaldo...', e.message);
+    }
+  }
+
+  // Capa 2: Respaldo en SoundCloud (Filtrando estrictamente covers, versiones acústicas y previews)
+  if (isYouTube) {
     const cleanTitle = cleanQueryForAudio(track.title);
-    const searchQuery = `scsearch5:${cleanTitle || track.title}`;
-    console.log(`[Música] Modo Servidor Nube: Buscando versión completa de estudio para "${track.title}"...`);
+    const searchQuery = `scsearch10:${cleanTitle || track.title}`;
+    console.log(`[Música] Modo Respaldo: Buscando versión original de estudio en SoundCloud para "${track.title}"...`);
 
     try {
       const searchProc = spawn(ytdl, [
@@ -246,18 +279,21 @@ async function resolveAudioStreamUrl(track) {
       for (const line of lines) {
         try {
           const item = JSON.parse(line);
-          // Filtrar estrictamente snippets de 30s (SoundCloud Go+ Previews) y transmisiones en vivo
-          if (item.duration && item.duration > 60 && !item.is_live) {
+          const tLower = (item.title || '').toLowerCase();
+          // Descartar imitaciones, covers amateurs con guitarra, tributos o karaokes
+          const isAmateurCover = /cover|ac[uú]stic|guitar|tributo|karaoke|instrumental|remix/i.test(tLower);
+
+          // Filtrar previews de 30s (SoundCloud Go+ Previews), transmisiones en vivo y covers
+          if (item.duration && item.duration > 60 && !item.is_live && !isAmateurCover) {
             pickedUrl = item.webpage_url || item.url;
             pickedDuration = Math.round(item.duration);
-            console.log(`[Música] Pista completa localizada: "${item.title}" (${pickedDuration}s)`);
+            console.log(`[Música] Pista oficial localizada en SoundCloud: "${item.title}" (${pickedDuration}s)`);
             break;
           }
         } catch (e) {}
       }
 
       if (pickedUrl) {
-        // Obtener la URL de transmisión directa HLS (.m3u8) o MP3
         const getUrlProc = spawn(ytdl, ['-g', '-f', 'bestaudio/b', pickedUrl]);
         let streamUrl = '';
         getUrlProc.stdout.on('data', d => { streamUrl += d.toString(); });
@@ -272,7 +308,7 @@ async function resolveAudioStreamUrl(track) {
     }
   }
 
-  // Caso 2: Con cookies o fuentes directas de yt-dlp
+  // Capa 3: Fuentes generales de yt-dlp
   try {
     const args = ['-g', '-f', 'bestaudio/b', '--no-warnings', '--no-check-certificates'];
     if (hasCookies) {
