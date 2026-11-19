@@ -203,6 +203,9 @@ function cleanQueryForAudio(query) {
     .trim();
 }
 
+// Caché de URLs de streaming resueltas en memoria (URL -> { streamUrl, expiresAt })
+const streamUrlCache = new Map();
+
 /**
  * Resuelve la URL directa de audio (HLS/HTTP) para streaming instantáneo con FFmpeg
  * Extrae directamente el audio ORIGINAL de YouTube utilizando el cliente oficial de Android
@@ -216,21 +219,29 @@ async function resolveAudioStreamUrl(track) {
     return { streamUrl: targetUrl, isDirect: true };
   }
 
+  // Comprobar caché en memoria para inicio instantáneo (0ms)
+  if (targetUrl && streamUrlCache.has(targetUrl)) {
+    const cached = streamUrlCache.get(targetUrl);
+    if (cached.expiresAt > Date.now()) {
+      return { streamUrl: cached.streamUrl, isDirect: true };
+    }
+    streamUrlCache.delete(targetUrl);
+  }
+
   const ytdl = await ensureYtDlp();
   const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
   const hasCookies = fs.existsSync(cookiesPath);
   const nodePath = process.execPath || 'node';
   const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
 
-  // Capa 1: Extraer audio ORIGINAL de YouTube vía Cliente Android / iOS Oficial
-  // Este extractor se comunica con la API de YouTube Mobile, la cual no aplica la pantalla
-  // de verificación de bots/CAPTCHA de los datacenters en la nube.
+  // Capa 1: Extraer audio ORIGINAL de YouTube vía Cliente Android Oficial (Ultrarrápido)
+  // El cliente Android de YouTube no tiene el bloqueo de bots/CAPTCHA de los datacenters en la nube.
   if (isYouTube) {
     try {
       const ytArgs = [
         '-g',
-        '-f', 'bestaudio/18/b',
-        '--extractor-args', 'youtube:player_client=android,ios',
+        '-f', '18/b',
+        '--extractor-args', 'youtube:player_client=android',
         '--no-warnings',
         '--no-check-certificates',
         '--no-cache-dir'
@@ -248,6 +259,11 @@ async function resolveAudioStreamUrl(track) {
 
       const finalUrl = directUrl.trim().split('\n')[0].trim();
       if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('ERROR:')) {
+        // Cachear durante 4 horas para repeticiones instantáneas
+        streamUrlCache.set(targetUrl, {
+          streamUrl: finalUrl,
+          expiresAt: Date.now() + 4 * 3600 * 1000
+        });
         console.log(`[Música] Transmitiendo versión original oficial: "${track.title}" (YouTube Audio Master)`);
         return { streamUrl: finalUrl, isDirect: true };
       }
@@ -347,9 +363,10 @@ async function createAudioPipeline(track, volume = 0.5) {
     const ffmpegProc = spawn(ffmpegBin, [
       '-reconnect', '1',
       '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-      '-i', streamUrl,
+      '-reconnect_delay_max', '3',
       '-analyzeduration', '0',
+      '-probesize', '32768',
+      '-i', streamUrl,
       '-loglevel', 'error',
       '-f', 's16le',
       '-ar', '48000',
@@ -581,19 +598,16 @@ async function searchTracks(query, limit = 5) {
   const wantsVideo = query.toLowerCase().includes('video') || query.toLowerCase().includes('clip');
   const cleanQ = cleanQueryForAudio(query);
 
-  // 3. CAPA 1: Scraper Nativo Directo de YouTube (Cero dependencias)
+  // 3. CAPA 1: Scraper Nativo Directo de YouTube (Ultrarrápido, 1 sola petición)
   try {
-    const searchQueries = wantsVideo ? [query] : [query, `${cleanQ || query} audio`];
-    for (const q of searchQueries) {
-      const directResults = await scrapeYouTubeDirect(q, candidateLimit);
-      if (directResults && directResults.length > 0) {
-        for (const t of directResults) {
-          if (!candidates.some(c => c.webUrl === t.webUrl)) {
-            candidates.push(t);
-          }
-        }
+    const directResults = await scrapeYouTubeDirect(query, candidateLimit);
+    if (directResults && directResults.length > 0) {
+      candidates = directResults;
+    } else if (!wantsVideo) {
+      const audioResults = await scrapeYouTubeDirect(`${cleanQ || query} audio`, candidateLimit);
+      if (audioResults && audioResults.length > 0) {
+        candidates = audioResults;
       }
-      if (candidates.length >= candidateLimit) break;
     }
   } catch (e) {}
 

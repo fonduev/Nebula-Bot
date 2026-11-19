@@ -12,7 +12,7 @@ const {
   StringSelectMenuBuilder
 } = require('discord.js');
 const { COLORS, SYMBOLS, createNebulaEmbed } = require('../utils/theme');
-const { resolveTrack, searchTracks, enqueueTrack } = require('../utils/musicManager');
+const { resolveTrack, searchTracks, enqueueTrack, getSession } = require('../utils/musicManager');
 
 function createPlayerEmbed(client, track, memberVoice, userTag, isPlayingNow, position) {
   return createNebulaEmbed(client, {
@@ -106,27 +106,37 @@ module.exports = {
       }
 
       try {
-        const result = await enqueueTrack(
-          interaction.guild,
-          memberVoice,
-          interaction.channel,
-          track,
-          interaction.user.tag
-        );
+        const session = getSession(interaction.guildId);
+        const isPlayingNow = !session || !session.currentTrack;
+        const position = session ? session.queue.length + 1 : 1;
 
         const embed = createPlayerEmbed(
           interaction.client,
           track,
           memberVoice,
           interaction.user.tag,
-          result.isPlayingNow,
-          result.position
+          isPlayingNow,
+          position
         );
 
-        return await interaction.editReply({
+        // Responder de inmediato en Discord (<300ms)
+        await interaction.editReply({
           embeds: [embed],
           components: createPlayerControlsRow(interaction.guildId)
         });
+
+        // Conectar e iniciar la transmisión en segundo plano
+        enqueueTrack(
+          interaction.guild,
+          memberVoice,
+          interaction.channel,
+          track,
+          interaction.user.tag
+        ).catch(err => {
+          console.error('Error al reproducir enlace directo:', err);
+        });
+
+        return;
       } catch (err) {
         console.error('Error al reproducir enlace directo:', err);
         return await interaction.editReply({
@@ -141,7 +151,7 @@ module.exports = {
       }
     }
 
-    // 2. Búsqueda por título en YouTube y Spotify
+    // 2. Búsqueda por título en YouTube y Spotify (<300ms)
     const results = await searchTracks(query, 5);
 
     if (!results || results.length === 0) {
@@ -156,30 +166,40 @@ module.exports = {
       });
     }
 
-    // Reproducir de inmediato la mejor coincidencia encontrada (sin esperas ni menús)
+    // Reproducir de inmediato la mejor coincidencia encontrada
     const track = results[0];
     try {
-      const result = await enqueueTrack(
-        interaction.guild,
-        memberVoice,
-        interaction.channel,
-        track,
-        interaction.user.tag
-      );
+      const session = getSession(interaction.guildId);
+      const isPlayingNow = !session || !session.currentTrack;
+      const position = session ? session.queue.length + 1 : 1;
 
       const embed = createPlayerEmbed(
         interaction.client,
         track,
         memberVoice,
         interaction.user.tag,
-        result.isPlayingNow,
-        result.position
+        isPlayingNow,
+        position
       );
 
-      return await interaction.editReply({
+      // Responder a Discord de INMEDIATO (<500ms) para respuesta ultrarrápida
+      await interaction.editReply({
         embeds: [embed],
         components: createPlayerControlsRow(interaction.guildId)
       });
+
+      // Conectar e iniciar el audio en segundo plano
+      enqueueTrack(
+        interaction.guild,
+        memberVoice,
+        interaction.channel,
+        track,
+        interaction.user.tag
+      ).catch(err => {
+        console.error('Error al reproducir pista:', err);
+      });
+
+      return;
     } catch (err) {
       console.error('Error al reproducir pista:', err);
       return await interaction.editReply({
