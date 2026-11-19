@@ -186,7 +186,20 @@ async function ensureYtDlp() {
 }
 
 /**
+ * Limpia el título de una canción para consultas de streaming
+ */
+function cleanQueryForAudio(query) {
+  if (!query) return '';
+  return query
+    .replace(/\s*[\(\[](official\s*(music\s*)?video|video\s*oficial|audio\s*oficial|video|audio|letra|lyrics|hd|4k|remastered|lyric\s*video)[\)\]]/gi, '')
+    .replace(/[^\w\s\u00C0-\u017F-]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Crea el pipeline de audio transmitiendo de yt-dlp a FFmpeg a Discord Voice
+ * Soporta modo Servidor Nube / Datacenter (SoundCloud High-Fidelity & cookies.txt)
  */
 async function createAudioPipeline(track, volume = 0.5) {
   const targetUrl = track.targetQuery || track.webUrl;
@@ -221,21 +234,43 @@ async function createAudioPipeline(track, volume = 0.5) {
     return { resource, processes: [ffmpegProc] };
   }
 
-  // Caso 2: Transmisión directa por tubería yt-dlp -> FFmpeg con resolución JS mediante Node
+  // Caso 2: Transmisión desde yt-dlp con soporte de cookies y bypass de Datacenter en la Nube
   const ytdl = await ensureYtDlp();
-
+  const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
+  const hasCookies = fs.existsSync(cookiesPath);
   const nodePath = process.execPath || 'node';
-  const ytdlProc = spawn(ytdl, [
+
+  // Si estamos en un VPS sin cookies y la fuente es YouTube, YouTube bloquea la IP con "Sign in to confirm you're not a bot"
+  // En ese caso, transmitimos automáticamente mediante SoundCloud High Fidelity para audio garantizado sin bloqueos.
+  let streamQuery = targetUrl;
+  const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
+
+  if (!hasCookies && isYouTube) {
+    const clean = cleanQueryForAudio(track.title);
+    streamQuery = `scsearch1:${clean || track.title}`;
+    console.log(`[Música] Modo Servidor Nube: Transmitiendo "${track.title}" vía SoundCloud High Fidelity`);
+  }
+
+  const ytdlArgs = [
     '-o', '-',
     '-f', 'bestaudio/b',
     '--no-playlist',
     '--no-warnings',
     '--no-check-certificates',
     '--no-cache-dir',
-    '--socket-timeout', '15',
-    '--js-runtimes', `node:${nodePath}`,
-    targetUrl
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    '--socket-timeout', '15'
+  ];
+
+  if (hasCookies) {
+    ytdlArgs.push('--cookies', cookiesPath);
+    ytdlArgs.push('--js-runtimes', `node:${nodePath}`);
+  } else if (!streamQuery.startsWith('scsearch')) {
+    ytdlArgs.push('--js-runtimes', `node:${nodePath}`);
+  }
+
+  ytdlArgs.push(streamQuery);
+
+  const ytdlProc = spawn(ytdl, ytdlArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   let ytdlErr = '';
   ytdlProc.stderr.on('data', d => { ytdlErr += d.toString(); });
