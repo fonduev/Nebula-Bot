@@ -55,10 +55,18 @@ for (const file of eventFiles) {
 
 // Manejo de errores globales para que el bot nunca se caiga
 process.on('unhandledRejection', error => {
+  if (error && error.message && error.message.includes('Cannot perform IP discovery')) {
+    console.warn('[Voz] ⚠️ Error de UDP en el servidor: El firewall iptables de Ubuntu está bloqueando los paquetes de audio de Discord.');
+    return;
+  }
   console.error('[Unhandled Rejection]', error);
 });
 
 process.on('uncaughtException', error => {
+  if (error && error.message && error.message.includes('429')) {
+    console.warn('[Voz] ⚠️ Rate-limit 429 temporal recibido de Discord por reintentos de conexión. Se estabilizará en unos segundos.');
+    return;
+  }
   console.error('[Uncaught Exception]', error);
 });
 

@@ -551,6 +551,18 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
       console.log(`[Voz] Conexión de audio: ${oldState.status} -> ${newState.status}`);
     });
 
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        ]);
+      } catch (error) {
+        try { connection.destroy(); } catch (e) {}
+        activeSessions.delete(guildId);
+      }
+    });
+
     player.on('stateChange', (oldState, newState) => {
       console.log(`[Música] Estado del reproductor: ${oldState.status} -> ${newState.status}`);
     });
