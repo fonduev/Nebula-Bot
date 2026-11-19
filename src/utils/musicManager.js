@@ -186,33 +186,133 @@ async function ensureYtDlp() {
 }
 
 /**
- * Limpia el título de una canción para consultas de streaming
+ * Limpia el título de una canción para consultas de streaming y búsquedas limpias
  */
 function cleanQueryForAudio(query) {
   if (!query) return '';
   return query
-    .replace(/\s*[\(\[](official\s*(music\s*)?video|video\s*oficial|audio\s*oficial|video|audio|letra|lyrics|hd|4k|remastered|lyric\s*video)[\)\]]/gi, '')
+    // Eliminar corchetes y paréntesis con anotaciones de video/audio/calidad/letra
+    .replace(/\s*[\(\[][^\)\]]*(video|audio|letra|lyrics|visualizer|remaster|versi[oó]n|en vivo|live|4k|hd|official|oficial)[^\)\]]*[\)\]]/gi, '')
+    // Eliminar cualquier corchete o paréntesis residual
+    .replace(/\s*[\(\[][^\)\]]*[\)\]]/g, '')
+    // Eliminar sufijos ft. o feat. para simplificar la búsqueda en SoundCloud
+    .replace(/\s+(ft|feat)\.?\s+.*/gi, '')
+    // Eliminar caracteres especiales manteniendo acentos y letras
     .replace(/[^\w\s\u00C0-\u017F-]/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 /**
- * Crea el pipeline de audio transmitiendo de yt-dlp a FFmpeg a Discord Voice
- * Soporta modo Servidor Nube / Datacenter (SoundCloud High-Fidelity & cookies.txt)
+ * Resuelve la URL directa de audio (HLS/HTTP) para streaming instantáneo con FFmpeg
+ * En servidores en la nube (OCI/AWS/VPS) sin cookies, busca la pista completa de estudio
+ * en SoundCloud (>60s) evitando el bloqueo de YouTube y las vistas previas cortadas de 30s.
+ */
+async function resolveAudioStreamUrl(track) {
+  const targetUrl = track.targetQuery || track.webUrl;
+  const isDirectAudio = track.isDirectStream || (targetUrl && (/\.(mp3|ogg|wav|aac|m3u8)($|\?)/i.test(targetUrl)));
+  if (isDirectAudio) {
+    return { streamUrl: targetUrl, isDirect: true };
+  }
+
+  const ytdl = await ensureYtDlp();
+  const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
+  const hasCookies = fs.existsSync(cookiesPath);
+  const nodePath = process.execPath || 'node';
+  const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
+
+  // Caso 1: Modo Servidor Nube / Datacenter (sin cookies.txt) para contenido de YouTube
+  // YouTube bloquea Datacenters con "Sign in to confirm you're not a bot".
+  // Resolvemos de forma ultra-rápida la versión completa en SoundCloud High Fidelity.
+  if (!hasCookies && isYouTube) {
+    const cleanTitle = cleanQueryForAudio(track.title);
+    const searchQuery = `scsearch5:${cleanTitle || track.title}`;
+    console.log(`[Música] Modo Servidor Nube: Buscando versión completa de estudio para "${track.title}"...`);
+
+    try {
+      const searchProc = spawn(ytdl, [
+        '-j', '--flat-playlist',
+        '--no-warnings', '--no-check-certificates',
+        searchQuery
+      ]);
+
+      let jsonOutput = '';
+      searchProc.stdout.on('data', d => { jsonOutput += d.toString(); });
+      await new Promise(r => searchProc.on('close', r));
+
+      const lines = jsonOutput.trim().split('\n').filter(Boolean);
+      let pickedUrl = null;
+      let pickedDuration = 0;
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line);
+          // Filtrar estrictamente snippets de 30s (SoundCloud Go+ Previews) y transmisiones en vivo
+          if (item.duration && item.duration > 60 && !item.is_live) {
+            pickedUrl = item.webpage_url || item.url;
+            pickedDuration = Math.round(item.duration);
+            console.log(`[Música] Pista completa localizada: "${item.title}" (${pickedDuration}s)`);
+            break;
+          }
+        } catch (e) {}
+      }
+
+      if (pickedUrl) {
+        // Obtener la URL de transmisión directa HLS (.m3u8) o MP3
+        const getUrlProc = spawn(ytdl, ['-g', '-f', 'bestaudio/b', pickedUrl]);
+        let streamUrl = '';
+        getUrlProc.stdout.on('data', d => { streamUrl += d.toString(); });
+        await new Promise(r => getUrlProc.on('close', r));
+        const finalUrl = streamUrl.trim().split('\n')[0].trim();
+        if (finalUrl && finalUrl.startsWith('http')) {
+          return { streamUrl: finalUrl, isDirect: true, durationSec: pickedDuration };
+        }
+      }
+    } catch (err) {
+      console.warn('[Música] Advertencia al resolver en SoundCloud:', err.message);
+    }
+  }
+
+  // Caso 2: Con cookies o fuentes directas de yt-dlp
+  try {
+    const args = ['-g', '-f', 'bestaudio/b', '--no-warnings', '--no-check-certificates'];
+    if (hasCookies) {
+      args.push('--cookies', cookiesPath);
+      args.push('--js-runtimes', `node:${nodePath}`);
+    } else if (targetUrl && !targetUrl.includes('youtube.com')) {
+      args.push('--js-runtimes', `node:${nodePath}`);
+    }
+    args.push(targetUrl);
+
+    const proc = spawn(ytdl, args);
+    let directUrl = '';
+    proc.stdout.on('data', d => { directUrl += d.toString(); });
+    await new Promise(r => proc.on('close', r));
+    const finalUrl = directUrl.trim().split('\n')[0].trim();
+    if (finalUrl && finalUrl.startsWith('http')) {
+      return { streamUrl: finalUrl, isDirect: true };
+    }
+  } catch (e) {
+    console.warn('[Música] Advertencia al extraer URL directa:', e.message);
+  }
+
+  return { streamUrl: targetUrl, isDirect: false };
+}
+
+/**
+ * Crea el pipeline de audio transmitiendo directamente a FFmpeg y Discord Voice
+ * Evita bloqueos por fragmentos temporales en disco y permite reconexión automática en la nube
  */
 async function createAudioPipeline(track, volume = 0.5) {
-  const targetUrl = track.targetQuery || track.webUrl;
-  const isDirectAudio = track.isDirectStream || (targetUrl && (targetUrl.endsWith('.mp3') || targetUrl.endsWith('.ogg') || targetUrl.endsWith('.wav')));
-
-  // Caso 1: Archivo o stream de audio directo por URL HTTP/HTTPS
   const ffmpegBin = getFfmpegBinary();
-  if (isDirectAudio) {
+  const { streamUrl, isDirect } = await resolveAudioStreamUrl(track);
+
+  // Transmisión directa nativa con FFmpeg (Soporta HLS m3u8, CDN MP3, AAC y audio HTTP sin escribir a disco)
+  if (isDirect && streamUrl && (streamUrl.startsWith('http://') || streamUrl.startsWith('https://'))) {
     const ffmpegProc = spawn(ffmpegBin, [
       '-reconnect', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5',
-      '-i', targetUrl,
+      '-i', streamUrl,
       '-analyzeduration', '0',
       '-loglevel', 'error',
       '-f', 's16le',
@@ -234,22 +334,11 @@ async function createAudioPipeline(track, volume = 0.5) {
     return { resource, processes: [ffmpegProc] };
   }
 
-  // Caso 2: Transmisión desde yt-dlp con soporte de cookies y bypass de Datacenter en la Nube
+  // Fallback secundario si la URL no fue extraída directamente
   const ytdl = await ensureYtDlp();
   const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
   const hasCookies = fs.existsSync(cookiesPath);
   const nodePath = process.execPath || 'node';
-
-  // Si estamos en un VPS sin cookies y la fuente es YouTube, YouTube bloquea la IP con "Sign in to confirm you're not a bot"
-  // En ese caso, transmitimos automáticamente mediante SoundCloud High Fidelity para audio garantizado sin bloqueos.
-  let streamQuery = targetUrl;
-  const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
-
-  if (!hasCookies && isYouTube) {
-    const clean = cleanQueryForAudio(track.title);
-    streamQuery = `scsearch5:${clean || track.title}`;
-    console.log(`[Música] Modo Servidor Nube: Transmitiendo "${track.title}" vía SoundCloud High Fidelity`);
-  }
 
   const ytdlArgs = [
     '-o', '-',
@@ -257,34 +346,16 @@ async function createAudioPipeline(track, volume = 0.5) {
     '--no-playlist',
     '--no-warnings',
     '--no-check-certificates',
-    '--no-cache-dir',
-    '--socket-timeout', '15'
+    '--no-cache-dir'
   ];
 
-  if (!hasCookies && isYouTube) {
-    // Filtrar snippets de preview de 30s para reproducir únicamente la canción completa
-    ytdlArgs.push('--max-downloads', '1', '--match-filter', 'duration > 60 & !is_live');
-  }
-
   if (hasCookies) {
-    ytdlArgs.push('--cookies', cookiesPath);
-    ytdlArgs.push('--js-runtimes', `node:${nodePath}`);
-  } else if (!streamQuery.startsWith('scsearch')) {
-    ytdlArgs.push('--js-runtimes', `node:${nodePath}`);
+    ytdlArgs.push('--cookies', cookiesPath, '--js-runtimes', `node:${nodePath}`);
   }
 
-  ytdlArgs.push(streamQuery);
+  ytdlArgs.push(streamUrl);
 
   const ytdlProc = spawn(ytdl, ytdlArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-
-  let ytdlErr = '';
-  ytdlProc.stderr.on('data', d => { ytdlErr += d.toString(); });
-  ytdlProc.on('close', code => {
-    if (code !== 0 && ytdlErr.trim()) {
-      console.warn(`[Música] Advertencia yt-dlp (código ${code}):`, ytdlErr.slice(0, 300).trim());
-    }
-  });
-
   const ffmpegProc = spawn(ffmpegBin, [
     '-i', 'pipe:0',
     '-analyzeduration', '0',
@@ -295,25 +366,16 @@ async function createAudioPipeline(track, volume = 0.5) {
     'pipe:1'
   ], { stdio: ['pipe', 'pipe', 'ignore'] });
 
-  // Conectar salida de yt-dlp con entrada de FFmpeg
   ytdlProc.stdout.pipe(ffmpegProc.stdin);
-
   ytdlProc.stdout.on('error', () => {});
   ffmpegProc.stdin.on('error', () => {});
   ffmpegProc.stdout.on('error', () => {});
-
-  ffmpegProc.on('error', err => {
-    console.error('[FFmpeg] Error en transcodificación:', err.message);
-  });
 
   const resource = createAudioResource(ffmpegProc.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true
   });
-
-  if (resource.volume) {
-    resource.volume.setVolume(volume);
-  }
+  if (resource.volume) resource.volume.setVolume(volume);
 
   return { resource, processes: [ytdlProc, ffmpegProc] };
 }
@@ -480,19 +542,29 @@ async function searchTracks(query, limit = 5) {
 
   let candidates = [];
   const candidateLimit = Math.max(limit * 2, 10);
+  const wantsVideo = query.toLowerCase().includes('video') || query.toLowerCase().includes('clip');
+  const cleanQ = cleanQueryForAudio(query);
 
   // 3. CAPA 1: Scraper Nativo Directo de YouTube (Cero dependencias)
   try {
-    const directResults = await scrapeYouTubeDirect(query, candidateLimit);
-    if (directResults && directResults.length > 0) {
-      candidates = directResults;
+    const searchQueries = wantsVideo ? [query] : [query, `${cleanQ || query} audio`];
+    for (const q of searchQueries) {
+      const directResults = await scrapeYouTubeDirect(q, candidateLimit);
+      if (directResults && directResults.length > 0) {
+        for (const t of directResults) {
+          if (!candidates.some(c => c.webUrl === t.webUrl)) {
+            candidates.push(t);
+          }
+        }
+      }
+      if (candidates.length >= candidateLimit) break;
     }
   } catch (e) {}
 
   // 4. CAPA 2: yt-search si está disponible
   if (candidates.length === 0 && yts) {
     try {
-      const res = await yts(query);
+      const res = await yts(wantsVideo ? query : `${cleanQ || query} audio`);
       const videos = res.videos || [];
       if (videos.length > 0) {
         candidates = videos.slice(0, candidateLimit).map(v => ({
@@ -764,5 +836,7 @@ module.exports = {
   togglePause,
   setVolume,
   getSession,
-  ensureYtDlp
+  ensureYtDlp,
+  resolveAudioStreamUrl,
+  cleanQueryForAudio
 };
