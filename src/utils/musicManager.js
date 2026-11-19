@@ -196,17 +196,19 @@ async function createAudioPipeline(track, volume = 0.5) {
     return { resource, processes: [ffmpegProc] };
   }
 
-  // Caso 2: Transmisión directa por tubería yt-dlp -> FFmpeg (Bypass de bloqueo de IPs datacenter)
+  // Caso 2: Transmisión directa por tubería yt-dlp -> FFmpeg con resolución JS mediante Node
   const ytdl = await ensureYtDlp();
 
+  const nodePath = process.execPath || 'node';
   const ytdlProc = spawn(ytdl, [
     '-o', '-',
     '-f', 'bestaudio/b',
     '--no-playlist',
     '--no-warnings',
     '--no-check-certificates',
+    '--no-cache-dir',
     '--socket-timeout', '15',
-    '--extractor-args', 'youtube:player_client=android,ios,web',
+    '--js-runtimes', `node:${nodePath}`,
     targetUrl
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
