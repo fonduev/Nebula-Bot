@@ -412,7 +412,40 @@ async function resolveTrack(query) {
 }
 
 /**
- * Busca múltiples pistas coincidentes en YouTube y Spotify (Triple Cascada)
+ * Pondera la calidad de una pista para priorizar audios oficiales de estudio (Spotify / Topic / Audio)
+ * y penalizar videoclips con diálogos, efectos o intros largas
+ */
+function scoreTrackForOfficialAudio(track, originalQuery) {
+  let score = 0;
+  const title = (track.title || '').toLowerCase();
+  const channel = (track.channel || '').toLowerCase();
+  const query = originalQuery.toLowerCase();
+
+  // 1. Canal de distribución oficial (Canales - Topic de Spotify/Apple Music)
+  if (channel.includes('- topic') || channel.includes('topic')) score += 60;
+
+  // 2. Títulos que indican explícitamente audio puro de estudio
+  if (/(\baudio\b|audio oficial|official audio|audio track|single)/i.test(title)) score += 50;
+  if (/(official lyric video|lyric video|letra)/i.test(title)) score += 35;
+
+  // 3. Penalizar fuertemente videoclips (suelen tener diálogos, ruidos de fondo e intros)
+  // a menos que el usuario haya escrito explícitamente "video" en su búsqueda
+  const wantsVideo = query.includes('video') || query.includes('clip');
+  if (!wantsVideo && /(official video|video oficial|music video|videoclip)/i.test(title) && !/audio/i.test(title)) {
+    score -= 70;
+  }
+
+  // 4. Penalizar versiones en vivo, acústicas o conciertos si no se pidieron
+  const wantsLive = query.includes('live') || query.includes('vivo') || query.includes('concierto') || query.includes('acoustic');
+  if (!wantsLive && /(live|en vivo|concierto|acoustic|acústico|festival)/i.test(title)) {
+    score -= 100;
+  }
+
+  return score;
+}
+
+/**
+ * Busca múltiples pistas coincidentes en YouTube y Spotify (Priorizando Audio Oficial de Estudio)
  */
 async function searchTracks(query, limit = 5) {
   query = query.trim();
@@ -424,11 +457,11 @@ async function searchTracks(query, limit = 5) {
       if (oembedRes.ok) {
         const data = await oembedRes.json();
         const searchTitle = data.title;
-        const results = await searchTracks(searchTitle, 1);
-        if (results && results.length > 0) {
-          const first = results[0];
+        const searchResults = await searchTracks(searchTitle, 5);
+        if (searchResults && searchResults.length > 0) {
+          const first = searchResults[0];
           first.title = data.title;
-          first.source = 'Spotify (vía YouTube)';
+          first.source = 'Spotify (Audio Oficial de Estudio)';
           if (data.thumbnail_url) first.thumbnail = data.thumbnail_url;
           return [first];
         }
@@ -445,21 +478,24 @@ async function searchTracks(query, limit = 5) {
     return [];
   }
 
+  let candidates = [];
+  const candidateLimit = Math.max(limit * 2, 10);
+
   // 3. CAPA 1: Scraper Nativo Directo de YouTube (Cero dependencias)
   try {
-    const directResults = await scrapeYouTubeDirect(query, limit);
+    const directResults = await scrapeYouTubeDirect(query, candidateLimit);
     if (directResults && directResults.length > 0) {
-      return directResults;
+      candidates = directResults;
     }
   } catch (e) {}
 
   // 4. CAPA 2: yt-search si está disponible
-  if (yts) {
+  if (candidates.length === 0 && yts) {
     try {
       const res = await yts(query);
       const videos = res.videos || [];
       if (videos.length > 0) {
-        return videos.slice(0, limit).map(v => ({
+        candidates = videos.slice(0, candidateLimit).map(v => ({
           title: v.title,
           duration: v.timestamp || 'En vivo',
           thumbnail: v.thumbnail || v.image || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500',
@@ -473,7 +509,17 @@ async function searchTracks(query, limit = 5) {
     } catch (e) {}
   }
 
-  return [];
+  if (candidates.length === 0) return [];
+
+  // Re-ordenar candidatos priorizando el audio oficial de estudio (Spotify/Topic/Audio)
+  candidates.sort((a, b) => scoreTrackForOfficialAudio(b, query) - scoreTrackForOfficialAudio(a, query));
+
+  return candidates.slice(0, limit).map(t => {
+    if ((t.channel && t.channel.toLowerCase().includes('topic')) || /audio/i.test(t.title)) {
+      t.source = 'Spotify / Audio Oficial';
+    }
+    return t;
+  });
 }
 
 /**
