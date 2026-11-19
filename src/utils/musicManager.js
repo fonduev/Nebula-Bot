@@ -247,7 +247,7 @@ async function createAudioPipeline(track, volume = 0.5) {
 
   if (!hasCookies && isYouTube) {
     const clean = cleanQueryForAudio(track.title);
-    streamQuery = `scsearch1:${clean || track.title}`;
+    streamQuery = `scsearch5:${clean || track.title}`;
     console.log(`[Música] Modo Servidor Nube: Transmitiendo "${track.title}" vía SoundCloud High Fidelity`);
   }
 
@@ -260,6 +260,11 @@ async function createAudioPipeline(track, volume = 0.5) {
     '--no-cache-dir',
     '--socket-timeout', '15'
   ];
+
+  if (!hasCookies && isYouTube) {
+    // Filtrar snippets de preview de 30s para reproducir únicamente la canción completa
+    ytdlArgs.push('--max-downloads', '1', '--match-filter', 'duration > 60 & !is_live');
+  }
 
   if (hasCookies) {
     ytdlArgs.push('--cookies', cookiesPath);
