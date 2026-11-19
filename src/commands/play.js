@@ -12,7 +12,7 @@ const {
   StringSelectMenuBuilder
 } = require('discord.js');
 const { COLORS, SYMBOLS, createNebulaEmbed } = require('../utils/theme');
-const { resolveTrack, searchTracks, enqueueTrack, getSession } = require('../utils/musicManager');
+const { resolveTrack, searchTracks, enqueueTrack, getSession, resolveAudioStreamUrl } = require('../utils/musicManager');
 
 function createPlayerEmbed(client, track, memberVoice, userTag, isPlayingNow, position) {
   return createNebulaEmbed(client, {
@@ -90,6 +90,10 @@ module.exports = {
     const isUrl = query.startsWith('http://') || query.startsWith('https://');
     if (isUrl) {
       const track = await resolveTrack(query);
+      if (track) {
+        // Disparar resolución en segundo plano de inmediato
+        resolveAudioStreamUrl(track).catch(() => {});
+      }
       if (!track) {
         return await interaction.editReply({
           embeds: [
@@ -168,6 +172,8 @@ module.exports = {
 
     // Reproducir de inmediato la mejor coincidencia encontrada
     const track = results[0];
+    // Iniciar resolución del audio en segundo plano de inmediato para velocidad máxima
+    resolveAudioStreamUrl(track).catch(() => {});
     try {
       const session = getSession(interaction.guildId);
       const isPlayingNow = !session || !session.currentTrack;

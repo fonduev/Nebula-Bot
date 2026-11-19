@@ -191,6 +191,10 @@ function cleanQueryForAudio(query) {
 
 // Caché de URLs de streaming resueltas en memoria (URL -> { streamUrl, expiresAt })
 const streamUrlCache = new Map();
+// Mapa de promesas en vuelo para evitar spawn duplicado de yt-dlp
+const inFlightResolutions = new Map();
+// Caché de búsquedas en memoria (Query -> { results, expiresAt })
+const searchResultsCache = new Map();
 
 /**
  * Resuelve la URL directa de audio (HLS/HTTP) para streaming instantáneo con FFmpeg
@@ -214,144 +218,158 @@ async function resolveAudioStreamUrl(track) {
     streamUrlCache.delete(targetUrl);
   }
 
-  const ytdl = await ensureYtDlp();
-  const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
-  const hasCookies = fs.existsSync(cookiesPath);
-  const nodePath = process.execPath || 'node';
-  const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
+  // Reutilizar promesa en vuelo si ya se está resolviendo en paralelo
+  if (targetUrl && inFlightResolutions.has(targetUrl)) {
+    return await inFlightResolutions.get(targetUrl);
+  }
 
-  // Capa 1: Extraer audio ORIGINAL de YouTube vía Clientes Oficiales Android/Móvil
-  // El cliente Android/Mweb de YouTube evita los bloqueos de bots de datacenters
-  if (isYouTube) {
-    try {
-      const ytArgs = [
-        '-g',
-        '-f', '18/140/251/bestaudio/best',
-        '--extractor-args', 'youtube:player_client=android,web,mweb',
-        '--no-warnings',
-        '--no-check-certificates',
-        '--no-cache-dir'
-      ];
-      if (hasCookies) {
-        ytArgs.push('--cookies', cookiesPath);
-        ytArgs.push('--js-runtimes', `node:${nodePath}`);
+  const resolvePromise = (async () => {
+    const ytdl = await ensureYtDlp();
+    const cookiesPath = path.join(__dirname, '..', '..', 'cookies.txt');
+    const hasCookies = fs.existsSync(cookiesPath);
+    const nodePath = process.execPath || 'node';
+    const isYouTube = targetUrl && (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be'));
+
+    // Capa 1: Extraer audio ORIGINAL de YouTube vía Cliente Android Optimizado (Ultrarrápido)
+    // Omitimos descarga de configs y página web para inicio inmediato (<1.5s)
+    if (isYouTube) {
+      try {
+        const ytArgs = [
+          '-g',
+          '-f', '18/140/bestaudio/best',
+          '--extractor-args', 'youtube:player_client=android;player_skip=webpage,configs',
+          '--no-playlist',
+          '--no-warnings',
+          '--no-check-certificates',
+          '--no-cache-dir'
+        ];
+        if (hasCookies) {
+          ytArgs.push('--cookies', cookiesPath);
+          ytArgs.push('--js-runtimes', `node:${nodePath}`);
+        }
+
+        ytArgs.push(targetUrl);
+        const proc = spawn(ytdl, ytArgs);
+        let directUrl = '';
+        let errOutput = '';
+        proc.stdout.on('data', d => { directUrl += d.toString(); });
+        proc.stderr.on('data', d => { errOutput += d.toString(); });
+        await new Promise(r => proc.on('close', r));
+
+        const finalUrl = directUrl.trim().split('\n')[0].trim();
+        if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('ERROR:')) {
+          streamUrlCache.set(targetUrl, {
+            streamUrl: finalUrl,
+            expiresAt: Date.now() + 4 * 3600 * 1000
+          });
+          console.log(`[Música] Transmitiendo versión original oficial: "${track.title}" (YouTube Audio Master)`);
+          return { streamUrl: finalUrl, isDirect: true };
+        }
+        if (errOutput) {
+          console.warn(`[Música] YouTube Android aviso: ${errOutput.slice(0, 150)}`);
+        }
+      } catch (e) {
+        console.warn('[Música] Falló cliente móvil de YouTube, probando respaldo...', e.message);
       }
+    }
 
-      ytArgs.push(targetUrl);
-      const proc = spawn(ytdl, ytArgs);
+    // Capa 2: Respaldo en SoundCloud (Filtrado estricto anti-covers y verificación de palabras clave)
+    if (isYouTube) {
+      const cleanTitle = cleanQueryForAudio(track.title);
+      const searchQuery = `scsearch10:${cleanTitle || track.title}`;
+      console.log(`[Música] Modo Respaldo: Buscando versión original de estudio en SoundCloud para "${track.title}"...`);
+
+      try {
+        const searchProc = spawn(ytdl, [
+          '-j', '--flat-playlist',
+          '--no-warnings', '--no-check-certificates',
+          searchQuery
+        ]);
+
+        let jsonOutput = '';
+        searchProc.stdout.on('data', d => { jsonOutput += d.toString(); });
+        await new Promise(r => searchProc.on('close', r));
+
+        const lines = jsonOutput.trim().split('\n').filter(Boolean);
+        const keywords = (cleanTitle || track.title || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        let pickedUrl = null;
+        let pickedDuration = 0;
+
+        for (const line of lines) {
+          try {
+            const item = JSON.parse(line);
+            const tLower = (item.title || '').toLowerCase();
+            const uploaderLower = (item.uploader || '').toLowerCase();
+
+            // El título DEBE contener las palabras clave esenciales de la canción
+            const hasKeyword = keywords.length === 0 || keywords.some(kw => tLower.includes(kw));
+            if (!hasKeyword) continue;
+
+            // Descartar imitaciones, covers amateurs, guitarras, tributos, karaokes o re-subidos extraños
+            const isAmateurCover =
+              /\b(cover|ac[uú]stic|guitar|guitarra|tributo|karaoke|instrumental|remix|parodia|tutorial|letra|lyrics)\b/i.test(tLower) ||
+              /canci[oó]n de|\bx\b|\.m4a|\.mp3/i.test(tLower) ||
+              /cover|guitar|records/i.test(uploaderLower);
+
+            // Filtrar previews de 30s (SoundCloud Go+ Previews), transmisiones en vivo y covers de aficionados
+            if (item.duration && item.duration > 60 && !item.is_live && !isAmateurCover) {
+              pickedUrl = item.webpage_url || item.url;
+              pickedDuration = Math.round(item.duration);
+              console.log(`[Música] Pista oficial válida localizada en SoundCloud: "${item.title}" (${pickedDuration}s)`);
+              break;
+            }
+          } catch (e) {}
+        }
+
+        if (pickedUrl) {
+          const getUrlProc = spawn(ytdl, ['-g', '-f', 'bestaudio/b', pickedUrl]);
+          let streamUrl = '';
+          getUrlProc.stdout.on('data', d => { streamUrl += d.toString(); });
+          await new Promise(r => getUrlProc.on('close', r));
+          const finalUrl = streamUrl.trim().split('\n')[0].trim();
+          if (finalUrl && finalUrl.startsWith('http')) {
+            return { streamUrl: finalUrl, isDirect: true, durationSec: pickedDuration };
+          }
+        } else {
+          console.warn(`[Música] SoundCloud no posee versión completa oficial autorizada para "${track.title}" (descartando covers de aficionados).`);
+        }
+      } catch (err) {
+        console.warn('[Música] Advertencia al resolver en SoundCloud:', err.message);
+      }
+    }
+
+    // Capa 3: Fuentes generales de yt-dlp
+    try {
+      const args = ['-g', '-f', 'bestaudio/b', '--no-warnings', '--no-check-certificates'];
+      if (hasCookies) {
+        args.push('--cookies', cookiesPath);
+        args.push('--js-runtimes', `node:${nodePath}`);
+      } else if (targetUrl && !targetUrl.includes('youtube.com')) {
+        args.push('--js-runtimes', `node:${nodePath}`);
+      }
+      args.push(targetUrl);
+
+      const proc = spawn(ytdl, args);
       let directUrl = '';
-      let errOutput = '';
       proc.stdout.on('data', d => { directUrl += d.toString(); });
-      proc.stderr.on('data', d => { errOutput += d.toString(); });
       await new Promise(r => proc.on('close', r));
-
       const finalUrl = directUrl.trim().split('\n')[0].trim();
-      if (finalUrl && finalUrl.startsWith('http') && !finalUrl.includes('ERROR:')) {
-        // Cachear durante 4 horas para repeticiones instantáneas
-        streamUrlCache.set(targetUrl, {
-          streamUrl: finalUrl,
-          expiresAt: Date.now() + 4 * 3600 * 1000
-        });
-        console.log(`[Música] Transmitiendo versión original oficial: "${track.title}" (YouTube Audio Master)`);
+      if (finalUrl && finalUrl.startsWith('http')) {
         return { streamUrl: finalUrl, isDirect: true };
       }
-      if (errOutput) {
-        console.warn(`[Música] YouTube Android/Mweb aviso: ${errOutput.slice(0, 150)}`);
-      }
     } catch (e) {
-      console.warn('[Música] Falló cliente móvil de YouTube, probando respaldo...', e.message);
+      console.warn('[Música] Advertencia al extraer URL directa:', e.message);
     }
-  }
 
-  // Capa 2: Respaldo en SoundCloud (Filtrado estricto anti-covers y verificación de palabras clave)
-  if (isYouTube) {
-    const cleanTitle = cleanQueryForAudio(track.title);
-    const searchQuery = `scsearch10:${cleanTitle || track.title}`;
-    console.log(`[Música] Modo Respaldo: Buscando versión original de estudio en SoundCloud para "${track.title}"...`);
+    return { streamUrl: targetUrl, isDirect: false };
+  })();
 
-    try {
-      const searchProc = spawn(ytdl, [
-        '-j', '--flat-playlist',
-        '--no-warnings', '--no-check-certificates',
-        searchQuery
-      ]);
-
-      let jsonOutput = '';
-      searchProc.stdout.on('data', d => { jsonOutput += d.toString(); });
-      await new Promise(r => searchProc.on('close', r));
-
-      const lines = jsonOutput.trim().split('\n').filter(Boolean);
-      const keywords = (cleanTitle || track.title || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
-      let pickedUrl = null;
-      let pickedDuration = 0;
-
-      for (const line of lines) {
-        try {
-          const item = JSON.parse(line);
-          const tLower = (item.title || '').toLowerCase();
-          const uploaderLower = (item.uploader || '').toLowerCase();
-
-          // El título DEBE contener las palabras clave esenciales de la canción
-          const hasKeyword = keywords.length === 0 || keywords.some(kw => tLower.includes(kw));
-          if (!hasKeyword) continue;
-
-          // Descartar imitaciones, covers amateurs, guitarras, tributos, karaokes o re-subidos extraños
-          const isAmateurCover =
-            /\b(cover|ac[uú]stic|guitar|guitarra|tributo|karaoke|instrumental|remix|parodia|tutorial|letra|lyrics)\b/i.test(tLower) ||
-            /canci[oó]n de|\bx\b|\.m4a|\.mp3/i.test(tLower) ||
-            /cover|guitar|records/i.test(uploaderLower);
-
-          // Filtrar previews de 30s (SoundCloud Go+ Previews), transmisiones en vivo y covers de aficionados
-          if (item.duration && item.duration > 60 && !item.is_live && !isAmateurCover) {
-            pickedUrl = item.webpage_url || item.url;
-            pickedDuration = Math.round(item.duration);
-            console.log(`[Música] Pista oficial válida localizada en SoundCloud: "${item.title}" (${pickedDuration}s)`);
-            break;
-          }
-        } catch (e) {}
-      }
-
-      if (pickedUrl) {
-        const getUrlProc = spawn(ytdl, ['-g', '-f', 'bestaudio/b', pickedUrl]);
-        let streamUrl = '';
-        getUrlProc.stdout.on('data', d => { streamUrl += d.toString(); });
-        await new Promise(r => getUrlProc.on('close', r));
-        const finalUrl = streamUrl.trim().split('\n')[0].trim();
-        if (finalUrl && finalUrl.startsWith('http')) {
-          return { streamUrl: finalUrl, isDirect: true, durationSec: pickedDuration };
-        }
-      } else {
-        console.warn(`[Música] SoundCloud no posee versión completa oficial autorizada para "${track.title}" (descartando covers de aficionados).`);
-      }
-    } catch (err) {
-      console.warn('[Música] Advertencia al resolver en SoundCloud:', err.message);
-    }
-  }
-
-  // Capa 3: Fuentes generales de yt-dlp
+  if (targetUrl) inFlightResolutions.set(targetUrl, resolvePromise);
   try {
-    const args = ['-g', '-f', 'bestaudio/b', '--no-warnings', '--no-check-certificates'];
-    if (hasCookies) {
-      args.push('--cookies', cookiesPath);
-      args.push('--js-runtimes', `node:${nodePath}`);
-    } else if (targetUrl && !targetUrl.includes('youtube.com')) {
-      args.push('--js-runtimes', `node:${nodePath}`);
-    }
-    args.push(targetUrl);
-
-    const proc = spawn(ytdl, args);
-    let directUrl = '';
-    proc.stdout.on('data', d => { directUrl += d.toString(); });
-    await new Promise(r => proc.on('close', r));
-    const finalUrl = directUrl.trim().split('\n')[0].trim();
-    if (finalUrl && finalUrl.startsWith('http')) {
-      return { streamUrl: finalUrl, isDirect: true };
-    }
-  } catch (e) {
-    console.warn('[Música] Advertencia al extraer URL directa:', e.message);
+    return await resolvePromise;
+  } finally {
+    if (targetUrl) inFlightResolutions.delete(targetUrl);
   }
-
-  return { streamUrl: targetUrl, isDirect: false };
 }
 
 /**
@@ -368,6 +386,8 @@ async function createAudioPipeline(track, volume = 0.5) {
       '-reconnect', '1',
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '3',
+      '-fflags', 'nobuffer+fastseek',
+      '-flags', 'low_delay',
       '-analyzeduration', '0',
       '-probesize', '32768',
       '-i', streamUrl,
@@ -569,6 +589,16 @@ function scoreTrackForOfficialAudio(track, originalQuery) {
 async function searchTracks(query, limit = 5) {
   query = query.trim();
 
+  // Comprobar caché de búsquedas recientes para respuesta instantánea (0ms)
+  const cacheKey = `${query.toLowerCase()}_${limit}`;
+  if (searchResultsCache.has(cacheKey)) {
+    const cached = searchResultsCache.get(cacheKey);
+    if (cached.expiresAt > Date.now()) {
+      return cached.results;
+    }
+    searchResultsCache.delete(cacheKey);
+  }
+
   // 1. Detectar enlaces de Spotify
   if (query.includes('spotify.com/')) {
     try {
@@ -640,12 +670,20 @@ async function searchTracks(query, limit = 5) {
   // Re-ordenar candidatos priorizando el audio oficial de estudio (Spotify/Topic/Audio)
   candidates.sort((a, b) => scoreTrackForOfficialAudio(b, query) - scoreTrackForOfficialAudio(a, query));
 
-  return candidates.slice(0, limit).map(t => {
+  const finalResults = candidates.slice(0, limit).map(t => {
     if ((t.channel && t.channel.toLowerCase().includes('topic')) || /audio/i.test(t.title)) {
       t.source = 'Spotify / Audio Oficial';
     }
     return t;
   });
+
+  // Guardar en caché para que las consultas repetidas respondan en 0ms
+  searchResultsCache.set(cacheKey, {
+    results: finalResults,
+    expiresAt: Date.now() + 60 * 60 * 1000 // 1 hora
+  });
+
+  return finalResults;
 }
 
 /**
@@ -690,6 +728,11 @@ async function playNext(guildId) {
     session.player.play(resource);
     session.isPaused = false;
     console.log(`[Música] Reproduciendo en ${guildId}: ${track.title}`);
+
+    // Pre-cargar la siguiente pista en segundo plano para que la transición sea instantánea (0ms)
+    if (session.queue.length > 0) {
+      resolveAudioStreamUrl(session.queue[0]).catch(() => {});
+    }
   } catch (error) {
     console.error(`[Música] Error al reproducir pista en ${guildId}:`, error);
     playNext(guildId);
@@ -706,6 +749,9 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
   track.requestedBy = requesterTag;
 
   if (!session) {
+    // Iniciar pre-resolución de audio en paralelo mientras se establece la conexión de voz
+    resolveAudioStreamUrl(track).catch(() => {});
+
     const connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guild.id,
@@ -802,6 +848,8 @@ async function enqueueTrack(guild, voiceChannel, textChannel, track, requesterTa
       return { session, isPlayingNow: true };
     } else {
       session.queue.push(track);
+      // Pre-cargar la pista añadida a la cola para arranque inmediato
+      resolveAudioStreamUrl(track).catch(() => {});
       return { session, isPlayingNow: false, position: session.queue.length };
     }
   }
